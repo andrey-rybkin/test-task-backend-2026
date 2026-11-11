@@ -1,4 +1,5 @@
 import time
+import inspect
 from typing import Type, Any, Iterator
 
 import requests
@@ -76,9 +77,29 @@ class BaseEntity:
         return str(self)
 
     def get_field(self, field_name):
-        return self.custom_fields_values.get(field_name, {}).get('value')
+        fields = self.custom_fields_values or {}
+        if isinstance(fields, dict):
+            field = fields.get(field_name)
+            if field is None:
+                return None
+            if not isinstance(field, dict):
+                return field
+            if 'value' in field:
+                return field.get('value')
+            return field
+        field = next((item for item in fields if item.get('field_name') == field_name), {})
+        values = field.get('values') or []
+        if values:
+            return values[0].get('value')
+        return field.get('value')
+
+    def as_dict(self):
+        """Return the CRM payload shape retained in JSONB."""
+        return {key: value for key, value in vars(self).items() if not key.startswith('_new_')}
 
     def set_field(self, field_name, field_value, field_id=None):
+        if self.custom_fields_values is None:
+            self.custom_fields_values = {}
         custom_field = self.custom_fields_values.get(field_name)
         if custom_field is None:
             if field_id is None:
@@ -105,24 +126,24 @@ class Customer(BaseEntity):
     entity_name = CUSTOMERS
 
     def __init__(self,
-                 id,
-                 name,
-                 next_price,
-                 next_date,
-                 responsible_user_id,
-                 status_id,
-                 periodicity,
-                 created_by,
-                 updated_by,
-                 created_at,
-                 updated_at,
-                 closest_task_at,
-                 is_deleted,
-                 ltv,
-                 purchases_count,
-                 average_check,
-                 account_id,
-                 custom_fields_values,
+                 id=None,
+                 name=None,
+                 next_price=None,
+                 next_date=None,
+                 responsible_user_id=None,
+                 status_id=None,
+                 periodicity=None,
+                 created_by=None,
+                 updated_by=None,
+                 created_at=None,
+                 updated_at=None,
+                 closest_task_at=None,
+                 is_deleted=None,
+                 ltv=None,
+                 purchases_count=None,
+                 average_check=None,
+                 account_id=None,
+                 custom_fields_values=None,
                  _embedded=None
                  ):
         self.id = id
@@ -207,6 +228,7 @@ class Lead(BaseEntity):
         self.companies = []
         if not _embedded:
             return
+        self.contacts = _embedded.get(CONTACTS, []) or []
 
 
 def amocrm_get(obj_cls: Type[BaseEntity],
@@ -239,8 +261,7 @@ def amocrm_get(obj_cls: Type[BaseEntity],
     base_url = ""
     url = f"{base_url}{obj_cls.url}"
     entity_name = obj_cls.entity_name
-    schema = obj_cls.get_schema(many=True)
-
+    accepted = inspect.signature(obj_cls).parameters
     while True:
         response = None
         json_data = None
@@ -263,7 +284,9 @@ def amocrm_get(obj_cls: Type[BaseEntity],
             break
         if json_data is not None:
             counter = 0
-            for entity in schema.load(json_data['_embedded'][entity_name]):
+            embedded = (json_data.get('_embedded') or {}).get(entity_name, []) or []
+            for item in embedded:
+                entity = obj_cls(**{key: value for key, value in item.items() if key in accepted})
                 counter += 1
                 skip_entity = False
                 if custom_filter:
@@ -283,11 +306,12 @@ def amocrm_get(obj_cls: Type[BaseEntity],
             # condition to stop while loop
             if page:
                 break
-            if counter < limit:
+            next_url = (json_data.get('_links') or {}).get('next', {}).get('href')
+            if not next_url:
                 break
             time.sleep(1)
             # reset url and params for page iteration
-            url = json_data['_links']['next']['href']
+            url = next_url
             params = {}
 
 

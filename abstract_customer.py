@@ -1,147 +1,114 @@
-import json
 import logging
-from collections import defaultdict
-from typing import Optional, Dict
+from typing import Dict, Optional
 
-from sqlalchemy import text
+from sqlalchemy import select
 
 from amocrm import Customer, Lead
-from models import AbstractCustomer, db, AbcCustomerEntities
+from models import AbstractCustomer, AmoCompany, AmoContact, AmoCustomer, AmoLead, db
 
 logger = logging.getLogger(__name__)
 
 
-def update_jsonb_field(entity_id: int,
-                       attribute: AbcCustomerEntities,
-                       index: int, new_value: Dict,
-                       table_name='abstract_customer'):
-    """Обновление jsonb поля в указанной таблице.
-    :param table_name: Название таблицы (должно быть прописано).
-    :param entity_id: ид абстрактного покупателя.
-    :param attribute: Поле таблицы, которое надо обновить в формате Enum.
-    :param index: Индекс изменения - цифра если массив, массив строк если словарь. Цифра должна быть точной.
-    :param new_value: Новые данные для изменения
-    """
-    if table_name != 'abstract_customer':
-        raise Exception("Неизвестная таблица")
-    query = text(f"""
-        UPDATE {table_name}
-        SET {attribute.value} = jsonb_set({attribute.value}, :path, :value)
-        WHERE id = :entity_id
-    """)
-    db.session.execute(query, {'path': f'{{{index}}}', 'value': json.dumps(new_value), 'entity_id': entity_id})
-
-
-def dict_compare_merge(l_dict1, l_dict2):
-    d = defaultdict(dict)
-    for i in l_dict1 + l_dict2:
-        d[i['general']['id']].update(i)
-
-    return list(d.values())
+def dict_compare_merge(left, right):
+    merged = {}
+    for item in (left or []) + (right or []):
+        entity_id = (item.get('general') or {}).get('id')
+        if entity_id is None:
+            continue
+        previous = merged.get(entity_id, {})
+        value = {**previous, **item}
+        value['general'] = {**(previous.get('general') or {}), **(item.get('general') or {})}
+        merged[entity_id] = value
+    return list(merged.values())
 
 
 def get_customer_json(customer: Customer) -> dict:
     return {
         'general': {
             'id': customer.id,
-            'login': customer.custom_fields_values.get('Логин', {}).get('value'),
-            'billing_type': customer.custom_fields_values.get('Вид оплаты', {}).get('value'),
-            'is_robot': bool(customer.custom_fields_values.get('Робот')),
-            'is_nds': bool(customer.custom_fields_values.get('Оплата с НДС')),
-            'system': customer.custom_fields_values.get('Система', {}).get('value'),
-            'host': customer.custom_fields_values.get('Хост', {}).get('value'),
+            'login': customer.get_field('Логин'),
+            'billing_type': customer.get_field('Вид оплаты'),
+            'is_robot': bool(customer.get_field('Робот')),
+            'is_nds': bool(customer.get_field('Оплата с НДС')),
+            'system': customer.get_field('Система'),
+            'host': customer.get_field('Хост'),
             'name': customer.name,
         },
-        'api_value': customer.as_dict()
+        'api_value': customer.as_dict(),
     }
 
 
 def get_lead_json(lead: Lead) -> dict:
     return {
-        'general': {
-            'id': lead.id,
-            'login': lead.custom_fields_values.get('Логин', {}).get('value'),
-            'name': lead.name,
-        },
-        'api_value': lead.as_dict()
+        'general': {'id': lead.id, 'login': lead.get_field('Логин'), 'name': lead.name},
+        'api_value': lead.as_dict(),
     }
 
 
-def get_abccustomer_by_lead_login(lead_login: str) -> Optional[AbstractCustomer]:
-    customers = db.session.query(AbstractCustomer).filter(
-        AbstractCustomer.amo_leads.op('@>')([{'general': {'login': lead_login}}])).all()
-
-    if len(customers) > 1:
-        logger.warning(f"Lead {lead_login} has more than one abccustomer")
+def _find_by_login(model, login) -> Optional[AbstractCustomer]:
+    if not login:
         return None
-    if not customers:
+    ids = db.session.scalars(
+        select(model.abstract_customer_id).where(model.login == login).distinct().limit(2)
+    ).all()
+    if len(ids) > 1:
+        logger.warning('Login %r has more than one abstract customer', login)
         return None
-
-    return customers[0]
-
-
-def get_abccustomer_by_amocustomer_login(customer_login: str) -> Optional[AbstractCustomer]:
-    customers = db.session.query(AbstractCustomer).filter(
-        AbstractCustomer.amo_customers.op('@>')([{'general': {'login': customer_login}}])).all()
-
-    if len(customers) > 1:
-        logger.warning(f"Customer {customer_login} has more than one abccustomer")
-        return None
-    if not customers:
-        return None
-
-    return customers[0]
+    return db.session.get(AbstractCustomer, ids[0]) if ids else None
 
 
-def create_or_update_customer(abstract_customer: Optional[AbstractCustomer], amo_customer: Customer):
-    if abstract_customer is None:
-        new_abstract_customer = AbstractCustomer(
-            amo_customers=[get_customer_json(amo_customer)],
-        )
-        db.session.add(new_abstract_customer)
-        return new_abstract_customer
-
-    abc_amo_customers = abstract_customer.amo_customers
-    if not abc_amo_customers:
-        # Не было покупателей
-        abstract_customer.amo_customers = [get_customer_json(amo_customer)]
-        return abstract_customer
-
-    index = [idx for idx, c in enumerate(abstract_customer.amo_customers) if c['general']['id'] == amo_customer.id]
-    if not index:
-        index = len(abstract_customer.amo_customers) + 1
-    else:
-        index = index[0]
-
-    update_jsonb_field(entity_id=abstract_customer.id,
-                       attribute=AbcCustomerEntities.AmoCustomer,
-                       index=index,
-                       new_value=get_customer_json(amo_customer))
-    return abstract_customer
+def get_abccustomer_by_lead_login(login: str) -> Optional[AbstractCustomer]:
+    return _find_by_login(AmoLead, login)
 
 
-def create_or_update_lead(abc_customer: Optional[AbstractCustomer], amo_lead: Lead) -> AbstractCustomer:
-    if abc_customer is None:
-        new_abstract_customer = AbstractCustomer(
-            amo_leads=[get_lead_json(amo_lead)])
-        db.session.add(new_abstract_customer)
+def get_abccustomer_by_amocustomer_login(login: str) -> Optional[AbstractCustomer]:
+    return _find_by_login(AmoCustomer, login)
+
+
+def _related(model, aggregate_id, refs):
+    for ref in refs or []:
+        crm_id = ref.get('id')
+        if crm_id is None:
+            continue
+        row = db.session.get(model, (crm_id, aggregate_id))
+        if row is None:
+            row = model(crm_id=crm_id, abstract_customer_id=aggregate_id)
+            db.session.add(row)
+        row.data = {'general': {'id': crm_id, 'name': ref.get('name')}, 'api_value': ref}
+
+
+def create_or_update_customer(aggregate: Optional[AbstractCustomer], customer: Customer):
+    if aggregate is None:
+        aggregate = AbstractCustomer()
+        db.session.add(aggregate)
+        db.session.flush()
+    row = db.session.get(AmoCustomer, customer.id)
+    if row is None:
+        row = AmoCustomer(crm_id=customer.id)
+        db.session.add(row)
+    row.abstract_customer_id = aggregate.id
+    row.data = get_customer_json(customer)
+    row.contact_ids = [ref['id'] for ref in customer.contacts or [] if ref.get('id') is not None]
+    row.company_ids = [ref['id'] for ref in customer.companies or [] if ref.get('id') is not None]
+    _related(AmoContact, aggregate.id, customer.contacts)
+    _related(AmoCompany, aggregate.id, customer.companies)
+    return aggregate
+
+
+def create_or_update_lead(aggregate: Optional[AbstractCustomer], lead: Lead,
+                          commit: bool = True) -> AbstractCustomer:
+    if aggregate is None:
+        aggregate = AbstractCustomer()
+        db.session.add(aggregate)
+        db.session.flush()
+    row = db.session.get(AmoLead, lead.id)
+    if row is None:
+        row = AmoLead(crm_id=lead.id)
+        db.session.add(row)
+    row.abstract_customer_id = aggregate.id
+    row.data = get_lead_json(lead)
+    row.contact_ids = [ref['id'] for ref in lead.contacts or [] if ref.get('id') is not None]
+    _related(AmoContact, aggregate.id, lead.contacts)
+    if commit:
         db.session.commit()
-        return new_abstract_customer
-
-    if not abc_customer.amo_leads:
-        abc_customer.amo_leads = [get_lead_json(amo_lead)]
-        db.session.commit()
-        return abc_customer
-
-    index = [idx for idx, c in enumerate(abc_customer.amo_leads) if c['general']['id'] == amo_lead.id]
-    if not index:
-        index = len(abc_customer.amo_leads) + 1
-    else:
-        index = index[0]
-
-    update_jsonb_field(entity_id=abc_customer.id,
-                       attribute=AbcCustomerEntities.AmoLead,
-                       index=index,
-                       new_value=get_lead_json(amo_lead))
-    db.session.commit()
-    return abc_customer
+    return aggregate

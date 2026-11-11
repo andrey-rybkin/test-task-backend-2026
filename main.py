@@ -1,175 +1,369 @@
+import json
 import logging
-from typing import Iterator, List, Dict
+from collections import defaultdict
 
-from sqlalchemy import delete, select
-from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy import bindparam, insert, select, text
+from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 
-from abstract_customer import get_abccustomer_by_lead_login, create_or_update_customer, \
-    get_abccustomer_by_amocustomer_login, dict_compare_merge, create_or_update_lead
-from amocrm import Customer, COMPANIES, CONTACTS, Lead, amocrm_get
-from models import db, AbstractCustomer
+from abstract_customer import get_customer_json, get_lead_json
+from amocrm import COMPANIES, CONTACTS, Customer, Lead, amocrm_get
+from models import AbstractCustomer, AmoCompany, AmoContact, AmoCustomer, AmoLead, db
 
 logger = logging.getLogger(__name__)
+BATCH_SIZE = 500
+SYNC_LOCK_ID = 20261109
 
 
-def lead_action(lead: Lead):
-    abstract_customer = db.session.query(AbstractCustomer).filter(
-        AbstractCustomer.amo_leads.op('@>')([{'general': {'id': lead.id}}])).first()
-    lead_login = lead.get_field('Логин')
-    if lead_login:
-        abs_customer_login = get_abccustomer_by_amocustomer_login(lead_login)
-        if abstract_customer is None:
-            abstract_customer = abs_customer_login
-        if abs_customer_login is not None:
-            if abs_customer_login.id != abstract_customer.id:
-                abstract_customer.amo_customers = dict_compare_merge(abstract_customer.amo_customers or [],
-                                                                     abs_customer_login.amo_customers or [])
-                abstract_customer.amo_leads = dict_compare_merge(abstract_customer.amo_leads or [],
-                                                                 abs_customer_login.amo_leads or [])
-                abstract_customer.amo_contacts = dict_compare_merge(abstract_customer.amo_contacts or [],
-                                                                    abs_customer_login.amo_contacts or [])
-                abstract_customer.amo_companies = dict_compare_merge(abstract_customer.amo_companies or [],
-                                                                     abs_customer_login.amo_companies or [])
-                flag_modified(abstract_customer, "amo_customers")
-                flag_modified(abstract_customer, "amo_leads")
-                flag_modified(abstract_customer, "amo_contacts")
-                flag_modified(abstract_customer, "amo_companies")
-                db.session.commit()
-                db.session.flush()
-                db.session.delete(abs_customer_login)
-                db.session.commit()
-                return
+def _payload(entity, kind):
+    return {
+        'data': get_customer_json(entity) if kind == 'customer' else get_lead_json(entity),
+        'contacts': getattr(entity, 'contacts', None) or [],
+        'companies': getattr(entity, 'companies', None) or [],
+    }
 
-    return create_or_update_lead(abstract_customer, lead)
+
+def _unique(mapping, login):
+    matches = mapping.get(login, set()) if login else set()
+    if len(matches) > 1:
+        logger.warning('Ambiguous CRM login %r; ignoring login match', login)
+        return None
+    return next(iter(matches), None)
+
+
+def _dedupe_refs(refs):
+    result = {}
+    for ref in refs or []:
+        if isinstance(ref, dict) and ref.get('id') is not None:
+            result[ref['id']] = ref
+    return list(result.values())
+
+
+class RecordIds:
+    def __init__(self, conn):
+        self.conn = conn
+        self.ids = []
+
+    def next(self):
+        if not self.ids:
+            self.ids = list(self.conn.execute(text("""
+                SELECT nextval(pg_get_serial_sequence('abstract_customer', 'id'))
+                FROM generate_series(1, :count)
+            """), {'count': BATCH_SIZE}).scalars())
+        return self.ids.pop()
+
+
+def _load_indexes(conn):
+    maps = {
+        'customer_id': {}, 'lead_id': {},
+        'customer_login': defaultdict(set), 'lead_login': defaultdict(set),
+        'customer_login_by_id': {}, 'lead_login_by_id': {},
+        'customer_login_count': defaultdict(int), 'lead_login_count': defaultdict(int),
+    }
+    for model, prefix in ((AmoCustomer, 'customer'), (AmoLead, 'lead')):
+        for crm_id, aggregate_id, login in conn.execute(
+            select(model.crm_id, model.abstract_customer_id, model.login)
+        ):
+            maps[f'{prefix}_id'][crm_id] = aggregate_id
+            maps[f'{prefix}_login_by_id'][crm_id] = (aggregate_id, login)
+            if login:
+                maps[f'{prefix}_login'][login].add(aggregate_id)
+                maps[f'{prefix}_login_count'][(login, aggregate_id)] += 1
+    return maps
+
+
+def _set_login(mapping, counts, login, aggregate_id, add):
+    if not login:
+        return
+    if add:
+        key = (login, aggregate_id)
+        counts[key] += 1
+        mapping[login].add(aggregate_id)
+    else:
+        key = (login, aggregate_id)
+        counts[key] -= 1
+        if counts[key] <= 0:
+            del counts[key]
+            mapping[login].discard(aggregate_id)
+            if not mapping[login]:
+                del mapping[login]
+
+
+def _allocate(conn, ids, pending_aggregates):
+    aggregate_id = ids.next()
+    pending_aggregates.add(aggregate_id)
+    return aggregate_id
+
+
+def _merge_aggregates(conn, target, source, maps, pending_aggregates):
+    if target == source:
+        return
+    if source in pending_aggregates:
+        pending_aggregates.discard(source)
+    # Move CRM rows; merge related JSON rows by the (aggregate, CRM ID) key.
+    for model in (AmoCustomer, AmoLead):
+        conn.execute(model.__table__.update().where(
+            model.abstract_customer_id == source
+        ).values(abstract_customer_id=target))
+    for model in (AmoContact, AmoCompany):
+        table = model.__table__
+        stmt = pg_insert(table).from_select(
+            [table.c.crm_id, table.c.abstract_customer_id, table.c.data],
+            select(table.c.crm_id, text(':target'), table.c.data)
+            .where(table.c.abstract_customer_id == source),
+        )
+        # Related duplicates already at the winner keep winner's payload.
+        conn.execute(stmt.on_conflict_do_nothing(
+            index_elements=[table.c.crm_id, table.c.abstract_customer_id]
+        ), {'target': target})
+        conn.execute(table.delete().where(table.c.abstract_customer_id == source))
+
+    source_methods, target_methods = conn.execute(text(
+        'SELECT (SELECT send_methods FROM abstract_customer WHERE id=:source), '
+        '(SELECT send_methods FROM abstract_customer WHERE id=:target)'
+    ), {'source': source, 'target': target}).one()
+    methods = {}
+    for item in (source_methods or []) + (target_methods or []):
+        methods[(item.get('type'), item.get('value'))] = item
+    conn.execute(text('UPDATE abstract_customer SET send_methods=:methods WHERE id=:target').bindparams(
+        bindparam('methods', type_=JSONB)),
+        {'methods': list(methods.values()), 'target': target})
+    conn.execute(text('DELETE FROM abstract_customer WHERE id=:source'), {'source': source})
+
+    for key in ('customer_id', 'lead_id'):
+        for crm_id, aggregate_id in list(maps[key].items()):
+            if aggregate_id == source:
+                maps[key][crm_id] = target
+    for kind in ('customer', 'lead'):
+        login_map = maps[f'{kind}_login']
+        counts = maps[f'{kind}_login_count']
+        for (login, aggregate_id), count in list(counts.items()):
+            if aggregate_id == source:
+                del counts[(login, source)]
+                counts[(login, target)] += count
+        for login, aggregates in list(login_map.items()):
+            if source in aggregates:
+                aggregates.discard(source)
+                aggregates.add(target)
+                if not aggregates:
+                    del login_map[login]
+        by_id = maps[f'{kind}_login_by_id']
+        for crm_id, (aggregate_id, login) in list(by_id.items()):
+            if aggregate_id == source:
+                by_id[crm_id] = (target, login)
+
+
+def _upsert(conn, model, rows, conflict, fields):
+    if not rows:
+        return
+    rows = list({tuple(row[name] for name in conflict): row for row in rows}.values())
+    table = model.__table__
+    stmt = pg_insert(table).values(rows)
+    conn.execute(stmt.on_conflict_do_update(
+        index_elements=[table.c[name] for name in conflict],
+        set_={name: getattr(stmt.excluded, name) for name in fields},
+        where=text(' OR '.join(f'{table.name}.{name} IS DISTINCT FROM excluded.{name}' for name in fields)),
+    ))
+
+
+def _stage_stream(conn, entity_cls, kind, with_value, full):
+    stream = amocrm_get(entity_cls, _with=with_value)
+    rows = []
+    ordinal = 0
+    for entity in stream:
+        if not full and ((kind == 'customer' and entity.status_id == 111349)
+                         or (kind == 'lead' and entity.status_id == 143)):
+            continue
+        if entity.id is None:
+            raise ValueError(f'{kind} CRM entity has no id')
+        if kind == 'customer' and not entity.get_field('Логин'):
+            # Keep the ID in staging for safe full cleanup, but do not write it.
+            payload = {'data': None, 'contacts': entity.contacts or [],
+                       'companies': entity.companies or []}
+        else:
+            payload = _payload(entity, kind)
+        rows.append({'kind': kind, 'ordinal': ordinal, 'crm_id': entity.id,
+                     'login': entity.get_field('Логин'), 'payload': payload})
+        ordinal += 1
+        if len(rows) == BATCH_SIZE:
+            conn.execute(text("""
+                INSERT INTO sync_stage(kind, ordinal, crm_id, login, payload)
+                VALUES (:kind, :ordinal, :crm_id, :login, CAST(:payload AS jsonb))
+            """), [{**r, 'payload': json.dumps(r['payload'])} for r in rows])
+            conn.commit()
+            rows.clear()
+    if rows:
+        conn.execute(text("""
+            INSERT INTO sync_stage(kind, ordinal, crm_id, login, payload)
+            VALUES (:kind, :ordinal, :crm_id, :login, CAST(:payload AS jsonb))
+        """), [{**r, 'payload': json.dumps(r['payload'])} for r in rows])
+        conn.commit()
+
+
+def _related_data(ref):
+    general = {'id': ref['id']}
+    general.update({key: ref[key] for key in ('name', 'phone', 'inn') if key in ref})
+    return {'general': general, 'api_value': ref}
+
+
+def _apply_kind(conn, kind, maps, ids, is_full):
+    is_customer = kind == 'customer'
+    model = AmoCustomer if is_customer else AmoLead
+    other_map = maps['lead_login'] if is_customer else maps['customer_login']
+    id_map = maps['customer_id'] if is_customer else maps['lead_id']
+    login_map = maps['customer_login'] if is_customer else maps['lead_login']
+    by_id_login = maps['customer_login_by_id'] if is_customer else maps['lead_login_by_id']
+    entity_rows, contact_rows, company_rows = [], [], []
+    pending_aggregates = set()
+    offset = 0
+
+    def flush():
+        if pending_aggregates:
+            conn.execute(insert(AbstractCustomer.__table__), [{'id': value} for value in pending_aggregates])
+            pending_aggregates.clear()
+        update_fields = ['abstract_customer_id', 'data']
+        if is_full:
+            update_fields.extend(['contact_ids', 'company_ids'])
+        _upsert(conn, model, entity_rows, ['crm_id'], update_fields)
+        if is_full:
+            _upsert(conn, AmoContact, contact_rows, ['crm_id', 'abstract_customer_id'], ['data'])
+            if is_customer:
+                _upsert(conn, AmoCompany, company_rows, ['crm_id', 'abstract_customer_id'], ['data'])
+        entity_rows.clear()
+        contact_rows.clear()
+        company_rows.clear()
+
+    while True:
+        staged = conn.execute(text("""
+            SELECT crm_id, login, payload FROM sync_stage
+            WHERE kind=:kind AND ordinal >= :offset
+            ORDER BY ordinal LIMIT :limit
+        """), {'kind': kind, 'offset': offset, 'limit': BATCH_SIZE}).mappings().all()
+        if not staged:
+            break
+        offset += len(staged)
+        for item in staged:
+            crm_id, login, payload = item['crm_id'], item['login'], item['payload']
+            if payload['data'] is None:
+                previous = by_id_login.get(crm_id)
+                if previous:
+                    _set_login(login_map, maps[f'{"customer" if is_customer else "lead"}_login_count'],
+                               previous[1], previous[0], False)
+                    by_id_login[crm_id] = (previous[0], None)
+                continue
+            by_id = id_map.get(crm_id)
+            by_login = _unique(other_map, login)
+            aggregate_id = by_id or by_login
+            if not is_customer and by_id is not None and by_login is not None and by_id != by_login:
+                flush()
+                _merge_aggregates(conn, by_id, by_login, maps, pending_aggregates)
+                aggregate_id = by_id
+            if aggregate_id is None:
+                aggregate_id = _allocate(conn, ids, pending_aggregates)
+
+            old = by_id_login.get(crm_id)
+            if old:
+                _set_login(login_map, maps[f'{"customer" if is_customer else "lead"}_login_count'],
+                           old[1], old[0], False)
+            entity_rows.append({
+                'crm_id': crm_id, 'abstract_customer_id': aggregate_id,
+                'data': payload['data'],
+                'contact_ids': sorted({r['id'] for r in _dedupe_refs(payload['contacts'])}),
+                'company_ids': sorted({r['id'] for r in _dedupe_refs(payload['companies'])}) if is_customer else [],
+            })
+            id_map[crm_id] = aggregate_id
+            by_id_login[crm_id] = (aggregate_id, login)
+            _set_login(login_map, maps[f'{"customer" if is_customer else "lead"}_login_count'],
+                       login, aggregate_id, True)
+            if is_full:
+                for ref in _dedupe_refs(payload['contacts']):
+                    contact_rows.append({'crm_id': ref['id'], 'abstract_customer_id': aggregate_id,
+                                         'data': _related_data(ref)})
+                if is_customer:
+                    for ref in _dedupe_refs(payload['companies']):
+                        company_rows.append({'crm_id': ref['id'], 'abstract_customer_id': aggregate_id,
+                                             'data': _related_data(ref)})
+
+        flush()
 
 
 def collect_leads_customers(is_full=True):
-    """
-     Берем всех покупателей, если его нет в бд - делаем новую запись AbstractCutomer, в него кладем.
-     Есть есть - находим его запись по id и перезаписываем
-
-     Вот так у нас коллектятся все кастомеры
-
-     Далее берутся все лиды. Ищутся их записи в бд по id, если не находится и есть логин
-     - находим его запись по кастомеру с тем же логином, кладем к нему.
-     Если нет логина/нет кастомера - пропускаем. Если нашелся - перезаписываем соответственно
-         abstract_id_customer : {
-        customers: [...],
-        leads: [...],
-        contacts: [...],
-        companies: [...]
-    }
-    """
-    session = db.session
-    customers: Iterator[Customer] = amocrm_get(Customer, _with=f"{COMPANIES},{CONTACTS}")
-    logger.info(f"Collected customers {is_full=}")
-
-    ids_map = {}
-    for customer in customers:
-        if is_full is False and customer.status_id == 111349:
-            continue
-        customer_login = customer.get_field('Логин')
-        if not customer_login:
-            continue
-        abstract_customer = session.query(AbstractCustomer).filter(
-            AbstractCustomer.amo_customers.op('@>')([{'general': {'id': customer.id}}])).first()
-
-        if not abstract_customer:
-            abstract_customer = get_abccustomer_by_lead_login(customer_login)  # почти всегда логины совпадают
-        abstract_customer = create_or_update_customer(abstract_customer, customer)
-        if is_full is True:
-            if abstract_customer.id in ids_map:
-                ids_map[abstract_customer.id]["customers"].append(customer.id)
-                ids_map[abstract_customer.id]["contacts"].extend([c["id"] for c in customer.contacts])
-                ids_map[abstract_customer.id]["companies"].extend([c["id"] for c in customer.companies])
-            else:
-                ids_map[abstract_customer.id] = {
-                    "customers": [customer.id],
-                    "contacts": [c["id"] for c in customer.contacts],
-                    "companies": [c["id"] for c in customer.companies],
-                    "leads": [],
-                }
-        db.session.commit()
-
-    del customers
-    amo_leads: Iterator[Lead] = amocrm_get(Lead, _with=f"{CONTACTS}")
-    logger.info(f"Collected leads {is_full=}")
-    for amo_lead in amo_leads:
-        if is_full is False and amo_lead.status_id == 143:
-            continue
-        try:
-            abc_customer = lead_action(amo_lead)
-            if is_full is True:
-                if abc_customer.id in ids_map:
-                    ids_map[abc_customer.id]["leads"].append(amo_lead.id)
-                    ids_map[abc_customer.id]["contacts"].extend([c["id"] for c in amo_lead.contacts])
-                else:
-                    ids_map[abc_customer.id] = {
-                        "customers": [],
-                        "contacts": [c["id"] for c in amo_lead.contacts],
-                        "companies": [],
-                        "leads": [amo_lead.id],
-                    }
-        except Exception as e:
-            logger.exception(f'{amo_lead} {e}')
-
-    if is_full is False:
-        return
+    """Stage the complete CRM snapshot, then apply it atomically to PostgreSQL."""
+    conn = db.engine.connect()
+    locked = False
     try:
-        logger.info("Чистка покупателей общая")
-        stmt = delete(AbstractCustomer).where(
-            AbstractCustomer.id.not_in(ids_map.keys())
-        )
-        db.session.execute(stmt)
-        db.session.commit()
-        logger.info("Чистка покупателей на уровне сущностей")
-        for abc_customer in db.session.scalars(select(AbstractCustomer)).all():
-            filter_abc_customer(abc_customer=abc_customer, ids_map=ids_map)
-    except Exception as e:
-        logger.exception(f"Чистка: {e}")
+        locked = bool(conn.execute(text('SELECT pg_try_advisory_lock(:key)'), {'key': SYNC_LOCK_ID}).scalar())
+        conn.commit()
+        if not locked:
+            raise RuntimeError('Another CRM synchronization is already running')
+        conn.execute(text('''
+            CREATE TEMP TABLE sync_stage (
+                kind text NOT NULL, ordinal bigint NOT NULL, crm_id bigint NOT NULL,
+                login text, payload jsonb NOT NULL,
+                PRIMARY KEY (kind, crm_id), UNIQUE (kind, ordinal)
+            ) ON COMMIT PRESERVE ROWS
+        '''))
+        conn.commit()
+        _stage_stream(conn, Customer, 'customer', f'{COMPANIES},{CONTACTS}', is_full)
+        _stage_stream(conn, Lead, 'lead', CONTACTS, is_full)
 
-
-def filter_merge_abstract_customer(abc_customer: AbstractCustomer, attr: str,
-                                   check_ids: List[int]):
-    entity = abc_customer.__getattribute__(attr)
-    for l in entity:
-        entity = [c for c in entity if
-                  'удалить' not in l['general'].get('name').lower() and l['general'].get('id') in check_ids]
-        setattr(abc_customer, attr, entity)
-        flag_modified(abc_customer, attr)
-        db.session.commit()
-
-
-def filter_abc_customer(abc_customer: AbstractCustomer, ids_map: Dict):
-    if abc_customer.amo_leads:
+        with conn.begin():
+            maps = _load_indexes(conn)
+            ids = RecordIds(conn)
+            _apply_kind(conn, 'customer', maps, ids, is_full)
+            _apply_kind(conn, 'lead', maps, ids, is_full)
+            if is_full:
+                for table in ('amo_customer', 'amo_lead', 'amo_contact', 'amo_company'):
+                    conn.execute(text(f"""
+                        DELETE FROM {table}
+                        WHERE strpos(translate(COALESCE(name, ''), 'УДАЛИТЬ', 'удалить'), 'удалить') > 0
+                    """))
+                conn.execute(text('''
+                    DELETE FROM amo_customer c
+                    WHERE NOT EXISTS (SELECT 1 FROM sync_stage s
+                                      WHERE s.kind='customer' AND s.crm_id=c.crm_id)
+                '''))
+                conn.execute(text('''
+                    DELETE FROM amo_lead l
+                    WHERE NOT EXISTS (SELECT 1 FROM sync_stage s
+                                      WHERE s.kind='lead' AND s.crm_id=l.crm_id)
+                '''))
+                conn.execute(text('''
+                    DELETE FROM amo_contact c
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM amo_customer ac
+                        WHERE ac.abstract_customer_id=c.abstract_customer_id
+                          AND c.crm_id = ANY(ac.contact_ids)
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM amo_lead al
+                        WHERE al.abstract_customer_id=c.abstract_customer_id
+                          AND c.crm_id = ANY(al.contact_ids)
+                    )
+                '''))
+                conn.execute(text('''
+                    DELETE FROM amo_company c
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM amo_customer ac
+                        WHERE ac.abstract_customer_id=c.abstract_customer_id
+                          AND c.crm_id = ANY(ac.company_ids)
+                    )
+                '''))
+                conn.execute(text('''
+                    DELETE FROM abstract_customer a
+                    WHERE NOT EXISTS (SELECT 1 FROM amo_customer c WHERE c.abstract_customer_id=a.id)
+                      AND NOT EXISTS (SELECT 1 FROM amo_lead l WHERE l.abstract_customer_id=a.id)
+                '''))
+    except Exception:
+        conn.rollback()
+        logger.exception('CRM synchronization failed; full-snapshot cleanup was not committed')
+        raise
+    finally:
         try:
-            filter_merge_abstract_customer(abc_customer=abc_customer,
-                                           attr="amo_leads",
-                                           check_ids=ids_map[abc_customer.id]["leads"])
-        except Exception as e:
-            logger.exception(e)
-    if abc_customer.amo_customers:
-        try:
-            filter_merge_abstract_customer(abc_customer=abc_customer,
-                                           attr="amo_customers",
-                                           check_ids=ids_map[abc_customer.id]["customers"])
-        except Exception as e:
-            logger.exception(e)
-    if abc_customer.amo_contacts:
-        try:
-            filter_merge_abstract_customer(abc_customer=abc_customer,
-                                           attr="amo_contacts",
-                                           check_ids=ids_map[abc_customer.id]["contacts"])
-        except Exception as e:
-            logger.exception(e)
-    if abc_customer.amo_companies:
-        try:
-            filter_merge_abstract_customer(abc_customer=abc_customer,
-                                           attr="amo_companies",
-                                           check_ids=ids_map[abc_customer.id]["companies"])
-        except Exception as e:
-            logger.exception(e)
-    if not abc_customer.amo_leads and not abc_customer.amo_customers:
-        db.session.flush()
-        db.session.delete(abc_customer)
-    db.session.commit()
+            if conn.in_transaction():
+                conn.rollback()
+            conn.execute(text('DROP TABLE IF EXISTS sync_stage'))
+            conn.commit()
+            if locked:
+                conn.execute(text('SELECT pg_advisory_unlock(:key)'), {'key': SYNC_LOCK_ID})
+                conn.commit()
+        finally:
+            conn.close()
