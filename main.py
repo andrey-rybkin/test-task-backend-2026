@@ -58,6 +58,7 @@ def _load_indexes(conn):
         'customer_login': defaultdict(set), 'lead_login': defaultdict(set),
         'customer_login_by_id': {}, 'lead_login_by_id': {},
         'customer_login_count': defaultdict(int), 'lead_login_count': defaultdict(int),
+        'customer_members': defaultdict(set), 'lead_members': defaultdict(set),
     }
     for model, prefix in ((AmoCustomer, 'customer'), (AmoLead, 'lead')):
         for crm_id, aggregate_id, login in conn.execute(
@@ -65,6 +66,7 @@ def _load_indexes(conn):
         ):
             maps[f'{prefix}_id'][crm_id] = aggregate_id
             maps[f'{prefix}_login_by_id'][crm_id] = (aggregate_id, login)
+            maps[f'{prefix}_members'][aggregate_id].add(crm_id)
             if login:
                 maps[f'{prefix}_login'][login].add(aggregate_id)
                 maps[f'{prefix}_login_count'][(login, aggregate_id)] += 1
@@ -129,27 +131,17 @@ def _merge_aggregates(conn, target, source, maps, pending_aggregates):
         {'methods': list(methods.values()), 'target': target})
     conn.execute(text('DELETE FROM abstract_customer WHERE id=:source'), {'source': source})
 
-    for key in ('customer_id', 'lead_id'):
-        for crm_id, aggregate_id in list(maps[key].items()):
-            if aggregate_id == source:
-                maps[key][crm_id] = target
     for kind in ('customer', 'lead'):
         login_map = maps[f'{kind}_login']
         counts = maps[f'{kind}_login_count']
-        for (login, aggregate_id), count in list(counts.items()):
-            if aggregate_id == source:
-                del counts[(login, source)]
-                counts[(login, target)] += count
-        for login, aggregates in list(login_map.items()):
-            if source in aggregates:
-                aggregates.discard(source)
-                aggregates.add(target)
-                if not aggregates:
-                    del login_map[login]
-        by_id = maps[f'{kind}_login_by_id']
-        for crm_id, (aggregate_id, login) in list(by_id.items()):
-            if aggregate_id == source:
-                by_id[crm_id] = (target, login)
+        members = maps[f'{kind}_members']
+        for crm_id in members.pop(source, ()):
+            _, login = maps[f'{kind}_login_by_id'][crm_id]
+            _set_login(login_map, counts, login, source, False)
+            _set_login(login_map, counts, login, target, True)
+            maps[f'{kind}_id'][crm_id] = target
+            maps[f'{kind}_login_by_id'][crm_id] = (target, login)
+            members[target].add(crm_id)
 
 
 def _upsert(conn, model, rows, conflict, fields):
@@ -212,6 +204,7 @@ def _apply_kind(conn, kind, maps, ids, is_full):
     id_map = maps['customer_id'] if is_customer else maps['lead_id']
     login_map = maps['customer_login'] if is_customer else maps['lead_login']
     by_id_login = maps['customer_login_by_id'] if is_customer else maps['lead_login_by_id']
+    members = maps['customer_members'] if is_customer else maps['lead_members']
     entity_rows, contact_rows, company_rows = [], [], []
     pending_aggregates = set()
     offset = 0
@@ -264,6 +257,8 @@ def _apply_kind(conn, kind, maps, ids, is_full):
             if old:
                 _set_login(login_map, maps[f'{"customer" if is_customer else "lead"}_login_count'],
                            old[1], old[0], False)
+                if old[0] != aggregate_id:
+                    members[old[0]].discard(crm_id)
             entity_rows.append({
                 'crm_id': crm_id, 'abstract_customer_id': aggregate_id,
                 'data': payload['data'],
@@ -272,6 +267,7 @@ def _apply_kind(conn, kind, maps, ids, is_full):
             })
             id_map[crm_id] = aggregate_id
             by_id_login[crm_id] = (aggregate_id, login)
+            members[aggregate_id].add(crm_id)
             _set_login(login_map, maps[f'{"customer" if is_customer else "lead"}_login_count'],
                        login, aggregate_id, True)
             if is_full:
@@ -315,7 +311,7 @@ def collect_leads_customers(is_full=True):
                 for table in ('amo_customer', 'amo_lead', 'amo_contact', 'amo_company'):
                     conn.execute(text(f"""
                         DELETE FROM {table}
-                        WHERE strpos(translate(COALESCE(name, ''), 'УДАЛИТЬ', 'удалить'), 'удалить') > 0
+                        WHERE COALESCE(name, '') ~ '[уУ][дД][аА][лЛ][иИ][тТ][ьЬ]'
                     """))
                 conn.execute(text('''
                     DELETE FROM amo_customer c
@@ -360,10 +356,21 @@ def collect_leads_customers(is_full=True):
         try:
             if conn.in_transaction():
                 conn.rollback()
-            conn.execute(text('DROP TABLE IF EXISTS sync_stage'))
-            conn.commit()
-            if locked:
-                conn.execute(text('SELECT pg_advisory_unlock(:key)'), {'key': SYNC_LOCK_ID})
+            try:
+                conn.execute(text('DROP TABLE IF EXISTS sync_stage'))
                 conn.commit()
+            except Exception:
+                conn.invalidate()  # The failed session may still hold a temp table or advisory lock.
+                raise
+            finally:
+                if locked and not conn.invalidated:
+                    if conn.in_transaction():
+                        conn.rollback()
+                    try:
+                        conn.execute(text('SELECT pg_advisory_unlock(:key)'), {'key': SYNC_LOCK_ID})
+                        conn.commit()
+                    except Exception:
+                        conn.invalidate()
+                        raise
         finally:
             conn.close()

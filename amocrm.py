@@ -36,6 +36,7 @@ class AmoCrmSearchError(Exception):
 
 class AmoCrmError(Exception):
     errors = {
+        "204": 'No Content',
         "301": 'Moved permanently',
         "400": 'Bad request',
         "401": 'Unauthorized',
@@ -262,6 +263,7 @@ def amocrm_get(obj_cls: Type[BaseEntity],
     url = f"{base_url}{obj_cls.url}"
     entity_name = obj_cls.entity_name
     accepted = inspect.signature(obj_cls).parameters
+    received_page = False
     while True:
         response = None
         json_data = None
@@ -280,9 +282,12 @@ def amocrm_get(obj_cls: Type[BaseEntity],
                 except Exception as e:
                     raise AmoCrmError(f"[!] {response.status_code if response else '<No code!>'} |"
                                       f" Неожиданная AMOCRM ошибка {e} ") from e
-        except AmoCrmNoConten:
+        except AmoCrmNoConten as exc:
+            if received_page:
+                raise AmoCrmError('CRM pagination stopped unexpectedly', error_code=204) from exc
             break
         if json_data is not None:
+            received_page = True
             counter = 0
             embedded = (json_data.get('_embedded') or {}).get(entity_name, []) or []
             for item in embedded:
